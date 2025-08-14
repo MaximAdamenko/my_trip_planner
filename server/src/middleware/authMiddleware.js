@@ -1,27 +1,52 @@
+// server/src/middleware/authMiddleware.js
 import jwt from "jsonwebtoken";
 
-export default function auth(req, res, next) {
-  try {
-    const h = req.headers.authorization || "";
-    const token = h.startsWith("Bearer ") ? h.slice(7).trim() : null;
-    if (!token) return res.status(401).json({ ok: false, error: "No token" });
+/**
+ * Extracts a Bearer token from the Authorization header.
+ */
+function getToken(req) {
+  const hdr = req.headers?.authorization || "";
+  return hdr.startsWith("Bearer ") ? hdr.slice(7) : null;
+}
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+/**
+ * Require a valid JWT. Attaches req.user = { id, email, name } on success.
+ */
+export function authRequired(req, res, next) {
+  const h = req.headers.authorization || "";
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  const token = m?.[1];
 
-    // accept multiple possible keys from older/newer payloads
-    const userId =
-      decoded?.id ||
-      decoded?._id ||
-      decoded?.sub ||
-      decoded?.userId ||
-      decoded?.user?.id;
-
-    if (!userId) {
-      return res.status(401).json({ ok: false, error: "Bad token" });
-    }
-    req.user = { id: String(userId) };
-    next();
-  } catch (e) {
-    return res.status(401).json({ ok: false, error: "Invalid or expired token" });
+  if (!token) {
+    return res.status(401).json({ error: "unauthorized" });
   }
+
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    // attach user identity to request
+    req.user = {
+      id: payload.sub || payload.id || payload.userId,
+      email: payload.email,
+      name: payload.name
+    };
+    next();
+  } catch {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+}
+
+/**
+ * Optional auth: if a valid token is present, sets req.user; otherwise continues.
+ */
+export function optionalAuth(req, _res, next) {
+  const token = getToken(req);
+  if (token) {
+    try {
+      const payload = jwt.verify(token, process.env.JWT_SECRET || "dev-secret");
+      req.user = { id: payload.id, email: payload.email, name: payload.name };
+    } catch {
+      // ignore invalid token for optional auth
+    }
+  }
+  next();
 }

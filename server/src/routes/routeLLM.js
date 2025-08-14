@@ -1,11 +1,11 @@
+// server/src/routes/routeLLM.js
 import { Router } from "express";
 import OpenAI from "openai";
 import { haversine, destPoint } from "../utils/geo.js";
 
 const router = Router();
 
-/* ---------------- helpers ---------------- */
-
+/* ---------- helpers ---------- */
 function bboxAround({ lat, lon }, km) {
   const dLat = km / 111;
   const dLon = km / (111 * Math.cos((lat * Math.PI) / 180));
@@ -36,16 +36,12 @@ async function geocodeInBBox(name, box, cityName) {
 }
 
 async function routeOSRM(profile, points, closeLoop) {
-  // points can be {lat,lon} or [lat,lon]
   const wp = closeLoop && points.length > 1 ? [...points, points[0]] : points;
   const coords = wp
-    .map((p) => {
-      const lat = p.lat ?? p[0];
-      const lon = p.lon ?? p[1];
-      return `${lon},${lat}`;
-    })
+    .map((p) => `${p.lon ?? p[1]},${p.lat ?? p[0]}`)
     .join(";");
 
+  // Try the requested profile first; fall back to driving if needed.
   let url = `https://router.project-osrm.org/route/v1/${profile}/${coords}?geometries=geojson&overview=full&steps=false&continue_straight=false`;
   let r = await fetch(url);
   if (!r.ok && profile !== "driving") {
@@ -87,7 +83,6 @@ function makeRing(center, days, type, scale = 1) {
     return { lat, lon };
   });
 
-  // hike = loop, bike = open
   return type === "bike" ? ring : [...ring, ring[0]];
 }
 
@@ -96,7 +91,7 @@ async function sizedProcedural(center, days, type, profile, closeLoop, tries = 6
   const maxTotal = Number(days) * (type === "bike" ? 60 : 15);
   const target   = (minTotal + maxTotal) / 2;
 
-  let factor = 1; // start scale
+  let factor = 1;
   let best = null, bestDiff = Infinity;
 
   for (let k = 0; k < tries; k++) {
@@ -108,61 +103,61 @@ async function sizedProcedural(center, days, type, profile, closeLoop, tries = 6
     const diff = Math.abs(tot - target);
     if (diff < bestDiff) { best = { line, tot }; bestDiff = diff; }
 
-    if (tot >= minTotal && tot <= maxTotal) break; // in range
+    if (tot >= minTotal && tot <= maxTotal) break;
 
-    // Damped scaling towards target to avoid oscillation
     if (tot > 0) {
       const ratio = target / tot;
-      factor *= Math.sqrt(ratio);
+      factor *= Math.sqrt(ratio); // damped adjustment
     }
   }
   return best;
 }
 
-/* ---------------- route ---------------- */
-
+/* ---------- route ---------- */
 router.post("/generate", async (req, res) => {
   try {
     const { location, days, type } = req.body || {};
-    if (!location || !days || !type) return res.status(400).json({ ok: false, error: "Invalid input" });
-    if (!process.env.OPENAI_API_KEY) return res.status(500).json({ ok: false, error: "Missing OPENAI_API_KEY" });
+    if (!location || !days || !type) {
+      return res.status(400).json({ ok: false, error: "Invalid input" });
+    }
 
     const city = typeof location === "string" ? await geocodeCity(location) : location;
-    if (!city?.lat || !city?.lon) return res.status(404).json({ ok: false, error: "Location not found" });
+    if (!city?.lat || !city?.lon) {
+      return res.status(404).json({ ok: false, error: "Location not found" });
+    }
 
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    let model = process.env.LLM_MODEL || "gpt-5-mini";
+    const haveKey = !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim());
+    const model   = process.env.LLM_MODEL || "gpt-4o-mini";
 
-    const prompt = `
+    let names = [];
+    if (haveKey) {
+      try {
+        const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        const prompt = `
 Return ONLY JSON with 5-10 short local waypoint names for a scenic ${type === "bike" ? "point-to-point" : "loop"} inside or very near the base city.
 Schema: {"waypoints":[{"name":"string"}]}
 Base city: ${location}
 Mode: ${type}
 Days: ${days}
-`.trim();
+        `.trim();
 
-    let resp;
-    try {
-      resp = await openai.chat.completions.create({
-        model,
-        response_format: { type: "json_object" },
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.3
-      });
-    } catch {
-      model = "gpt-4o-mini";
-      resp = await openai.chat.completions.create({
-        model,
-        response_format: { type: "json_object" },
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.3
-      });
+        const resp = await openai.chat.completions.create({
+          model,
+          response_format: { type: "json_object" },
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0.3
+        });
+
+        const json = extractJSON(resp?.choices?.[0]?.message?.content || "");
+        names = (json?.waypoints || []).map(w => w?.name).filter(Boolean);
+      } catch (e) {
+        console.warn("[LLM] Skipping LLM (will fall back):", e?.message || e);
+      }
+    } else {
+      console.warn("[LLM] No OPENAI_API_KEY; generating procedural route.");
     }
 
-    const json  = extractJSON(resp?.choices?.[0]?.message?.content || "");
-    const names = (json?.waypoints || []).map((w) => w?.name).filter(Boolean);
-
-    // geocode names near the city
+    // Geocode the waypoints (if any)
     const box  = bboxAround({ lat: city.lat, lon: city.lon }, type === "bike" ? 25 : 8);
     const geos = [];
     for (const n of names) {
@@ -170,19 +165,17 @@ Days: ${days}
       if (g) geos.push(g);
     }
 
-    const profile  = type === "bike" ? "cycling" : "walking";
+    const profile   = type === "bike" ? "cycling" : "walking";
     const closeLoop = type !== "bike";
 
     let line = geos.length >= 2 ? await routeOSRM(profile, geos, closeLoop) : null;
 
-    // distance constraints
     const minTotal = Number(days) * (type === "bike" ? 30 : 5);
     const maxTotal = Number(days) * (type === "bike" ? 60 : 15);
 
-    let total = 0;
-    if (line) total = sumKm(line);
+    let total = line ? sumKm(line) : 0;
 
-    // Fallback or out-of-bounds -> sized procedural + snap
+    // Always guarantee a route (within bounds) by procedural fallback.
     if (!line || total < minTotal || total > maxTotal) {
       const sized = await sizedProcedural({ lat: city.lat, lon: city.lon }, days, type, profile, closeLoop);
       if (!sized) return res.status(502).json({ ok: false, error: "Routing service failed" });
@@ -190,11 +183,11 @@ Days: ${days}
       total = sized.tot;
     }
 
-    // compute day-break indices (nice even split, clamped by allowed per-day)
-    const minDay = type === "bike" ? 30 : 5;
-    const maxDay = type === "bike" ? 60 : 15;
-    const perDay = Math.min(maxDay, Math.max(minDay, total / Number(days)));
-
+    // Compute per-day markers
+    const perDay = Math.min(
+      type === "bike" ? 60 : 15,
+      Math.max(type === "bike" ? 30 : 5, total / Number(days))
+    );
     const breaks = [];
     let acc = 0;
     for (let i = 1; i < line.length; i++) {
@@ -204,14 +197,15 @@ Days: ${days}
       }
     }
 
-    res.json({
+    return res.json({
       ok: true,
       center: { lat: city.lat, lon: city.lon, name: city.name },
-      points: line, // [ [lat,lon], ... ]
+      points: line,                    // [[lat, lon], ...]
       meta: { days: Number(days), type, totalKm: Math.round(total), breaks }
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    console.error("[/api/llm/generate] error:", e);
+    return res.status(500).json({ ok: false, error: e.message || "Internal error" });
   }
 });
 

@@ -1,83 +1,66 @@
 import { Router } from "express";
-import Trip from "../models/Trip.js";
-import auth from "../middleware/authMiddleware.js";
+import fs from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
+import crypto from "crypto";
 
 const router = Router();
 
-// helper: normalize incoming [lat,lon] or {lat,lon} into numbers
-function normalizePoints(arr) {
-  if (!Array.isArray(arr)) return [];
-  return arr.map((p) => {
-    const lat = Array.isArray(p) ? p[0] : p?.lat;
-    const lon = Array.isArray(p) ? p[1] : p?.lon;
-    return { lat: Number(lat), lon: Number(lon) };
-  });
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = path.join(__dirname, "..", "..", "data");
+const FILE = path.join(DATA_DIR, "trips.json");
+
+async function loadTrips() {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  try {
+    const s = await fs.readFile(FILE, "utf8");
+    return JSON.parse(s);
+  } catch (e) {
+    if (e.code === "ENOENT") {
+      await fs.writeFile(FILE, "[]");
+      return [];
+    }
+    throw e;
+  }
 }
 
-// Create (save) a trip
-router.post("/", auth, async (req, res) => {
-  try {
-    const { name, description, type, days, totalKm, center, points } = req.body || {};
+async function saveTrips(all) {
+  await fs.writeFile(FILE, JSON.stringify(all, null, 2));
+}
 
-    const pts = normalizePoints(points);
-    if (!name || !type || !days || !totalKm || pts.length < 2) {
-      return res.status(400).json({ ok: false, error: "Missing or invalid fields" });
-    }
-    if (!req.user?.id) {
-      return res.status(401).json({ ok: false, error: "Unauthorized" });
-    }
+// GET /api/trips  -> list current user's trips
+router.get("/", async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ ok: false, error: "unauthorized" });
+  const all = await loadTrips();
+  res.json({ ok: true, trips: all.filter(t => t.userId === userId) });
+});
 
-    const trip = await Trip.create({
-      userId: req.user.id,
-      name,
-      description: description || "",
-      type,                // "hike" | "bike"
-      days: Number(days),
-      totalKm: Number(totalKm),
-      center: center
-        ? { lat: Number(center.lat), lon: Number(center.lon) }
-        : undefined,
-      points: pts,
-    });
+// POST /api/trips -> create a trip for current user
+router.post("/", async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ ok: false, error: "unauthorized" });
 
-    res.json({ ok: true, trip });
-  } catch (e) {
-    // surface a clearer server error to the client
-    res.status(500).json({ ok: false, error: e.message || "Server error" });
+  const { name, description = "", points = [], meta = {}, center = null } = req.body || {};
+  if (!name || !Array.isArray(points) || points.length < 2) {
+    return res.status(400).json({ ok: false, error: "Bad payload" });
   }
-});
 
-// List my trips (handy for Day 7)
-router.get("/", auth, async (req, res) => {
-  const trips = await Trip.find({ userId: req.user.id }).sort({ createdAt: -1 }).lean();
-  res.json({ ok: true, trips });
+  const all = await loadTrips();
+  const trip = {
+    id: crypto.randomUUID(),
+    userId,
+    name,
+    description,
+    points,
+    meta,
+    center,
+    createdAt: new Date().toISOString(),
+  };
+  all.push(trip);
+  await saveTrips(all);
+  res.status(201).json({ ok: true, trip });
 });
-
-router.get("/:id", auth, async (req, res) => {
-  const t = await Trip.findOne({ _id: req.params.id, userId: req.user.id }).lean();
-  if (!t) return res.status(404).json({ ok: false, error: "Not found" });
-  res.json({ ok: true, trip: t });
-});
-
-// Rename a trip
-router.patch("/:id", auth, async (req, res) => {
-  const { name } = req.body || {};
-  if (!name) return res.status(400).json({ ok: false, error: "Name required" });
-  const t = await Trip.findOneAndUpdate(
-    { _id: req.params.id, userId: req.user.id },
-    { $set: { name } },
-    { new: true }
-  ).lean();
-  if (!t) return res.status(404).json({ ok: false, error: "Not found" });
-  res.json({ ok: true, trip: t });
-});
-
-// Delete a trip
-router.delete("/:id", auth, async (req, res) => {
-  const r = await Trip.deleteOne({ _id: req.params.id, userId: req.user.id });
-  if (!r.deletedCount) return res.status(404).json({ ok: false, error: "Not found" });
-  res.json({ ok: true });
-});
-
 
 export default router;
+

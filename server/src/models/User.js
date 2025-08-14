@@ -1,11 +1,14 @@
+// server/src/models/User.js
 import mongoose from "mongoose";
 
-const userSchema = new mongoose.Schema(
+const UserSchema = new mongoose.Schema(
   {
-    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-    passwordHash: { type: String, required: true }
+    name: { type: String, default: "" },
+    email: { type: String, required: true, unique: true, index: true },
+    password: { type: String, required: true }, // bcrypt hash
   },
   { timestamps: true }
 );
 
-export default mongoose.model("User", userSchema);
+const User = mongoose.models.User || mongoose.model("User", UserSchema);
+export default User;
