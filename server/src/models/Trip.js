@@ -7,16 +7,35 @@ const PointSchema = new mongoose.Schema(
 
 const TripSchema = new mongoose.Schema(
   {
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
-    name: { type: String, required: true, trim: true },
+    name: { type: String, default: "Untitled" },
     description: { type: String, default: "" },
-    type: { type: String, enum: ["hike", "bike"], required: true },
-    days: { type: Number, required: true },
-    totalKm: { type: Number, required: true },
-    center: { lat: Number, lon: Number },
-    points: { type: [PointSchema], required: true }, // [{lat,lon}, ...]
+    // store [ [lat, lon], ... ]
+    points: {
+      type: [[Number]],
+      required: true,
+      validate: {
+        validator(arr) {
+          return Array.isArray(arr) && arr.length >= 2 && arr.every(p => Array.isArray(p) && p.length === 2);
+        },
+        message: "points must be [[lat,lon], ...] with length >= 2",
+      },
+    },
+    meta: {
+      days: Number,
+      type: { type: String }, // "hike" | "bike"
+      totalKm: Number,
+      breaks: [Number],
+    },
+    center: {
+      lat: Number,
+      lon: Number,
+      name: String,
+    },
+    // OPTIONAL owner: present if a valid JWT was sent, otherwise null
+    owner: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    createdAt: { type: Date, default: Date.now },
   },
-  { timestamps: true }
+  { versionKey: false }
 );
 
 export default mongoose.model("Trip", TripSchema);
